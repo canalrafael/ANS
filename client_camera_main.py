@@ -115,6 +115,9 @@ def parse_args():
     parser.add_argument('--port', dest='port',
                         help='Ip port',
                         default=8080, type=int)
+    parser.add_argument('--no-display', dest='no_display',
+                        help='run without GUI window (for headless Raspberry Pi)',
+                        action='store_true')
     args = parser.parse_args()
     return args
 
@@ -130,12 +133,13 @@ def open_cam_rtsp(uri, width, height, latency):
 
 
 def open_cam_usb(dev, width, height):
-    # We want to set width and height here, otherwise we could just do:
-    #     return cv2.VideoCapture(dev)
-    gst_str = ('v4l2src device=/dev/video{} ! '
-               'video/x-raw, width=(int){}, height=(int){} ! '
-               'videoconvert ! appsink').format(dev, width, height)
-    return cv2.VideoCapture(gst_str, cv2.CAP_GSTREAMER)
+    # Use native Linux V4L2 directly (GStreamer pipelines often hang on USB webcams)
+    cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(dev)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    return cap
 
 
 def open_cam_onboard(width, height):
@@ -214,14 +218,16 @@ def decodePrediction_vgg(res, labels):
     label_index = torch.argmax(res).item()
     return labels[label_index]
 
-def getActualDelay(action, model, preprocessed_image, totallayerNo, communication):
+def getActualDelay(action, model, preprocessed_image, totallayerNo, communication, device=None):
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if action == totallayerNo - 1: # local mobile process
-        prediction = model(preprocessed_image.cuda())
+        prediction = model(preprocessed_image.to(device))
         return 0, prediction.item()
     else:
-        intermediate_output = model(preprocessed_image.cuda(), server=False, partition=action)
+        intermediate_output = model(preprocessed_image.to(device), server=False, partition=action)
 
-    data_to_server = [action, intermediate_output.data]
+    data_to_server = [action, intermediate_output.data.cpu()]
     del intermediate_output
 
     start_time = time.time()
@@ -257,7 +263,9 @@ if __name__ == '__main__':
         labels = load_class_names('models/voc.names')
         partitionInfo = yolo_info
 
-    model.cuda()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print('Using device: {}'.format(device))
+    model.to(device)
     Action_num = len(partitionInfo)
 
     muLinUCB = muLinUCB(mu=0.25, layerInfo=partitionInfo, frontDelay=frontEndDelay)
@@ -279,7 +287,8 @@ if __name__ == '__main__':
     if not cap.isOpened():
         sys.exit('Failed to open camera!')
 
-    open_window(args.image_width, args.image_height)
+    if not args.no_display:
+        open_window(args.image_width, args.image_height)
 
     show_help = True
     full_scrn = False
@@ -293,11 +302,16 @@ if __name__ == '__main__':
     KeyFrame = KeyFrameDetection(threshold=0.8)
 
     while True:
-        if cv2.getWindowProperty(WINDOW_NAME, 0) < 0:
-            # Check to see if the user has closed the window
-            # If yes, terminate the program
-            break
-        _, img = cap.read()  # grab the next image frame from camera
+        if not args.no_display:
+            if cv2.getWindowProperty(WINDOW_NAME, 0) < 0:
+                # Check to see if the user has closed the window
+                # If yes, terminate the program
+                break
+        ret, img = cap.read()
+        if not ret or img is None:
+            print('Waiting for camera frame...')
+            time.sleep(0.1)
+            continue
 
         if args.dnn_model == 'vgg':
             preprocessed_image = prepare_image_vgg(img)
@@ -317,53 +331,54 @@ if __name__ == '__main__':
             keyflag = KeyFrame.compare_images(old_frame, img)
             old_frame = np.copy(img)
 
-        # print('keyflag', keyflag)
-
         partitionPoint = muLinUCB.getEstimationAction(keyflag, currentFrameNum)
-        # print('partitionPoint', partitionPoint)
+        print('Capturing frame {} | Partition selected: {} | Offloading to server...'.format(total_frame_num + 1, partitionPoint))
 
         end2endtime_start = time.time()
-        actual_delay, res = getActualDelay(partitionPoint, model, preprocessed_image, Action_num, communication)
+        actual_delay, res = getActualDelay(partitionPoint, model, preprocessed_image, Action_num, communication, device)
 
         end2endtime_end = time.time()
 
         total_frame_num = total_frame_num + 1
         total_time = total_time + (end2endtime_end - end2endtime_start)
         average_time = total_time/total_frame_num
+        print('Frame: {} | Partition: {} | Delay: {:.4f}s | Avg: {:.4f}s'.format(
+            total_frame_num, partitionPoint, actual_delay, average_time))
 
         # update A and b
         muLinUCB.updateA_b(partitionPoint, actual_delay)
 
-        # print results on  the screen
-        if args.dnn_model == 'vgg':
-            label = decodePrediction_vgg(res, labels)
-            img = show_preds(img, label, average_time)
-        else:
-            boxes = get_boxes(res, model, conf_thresh=0.5, nms_thresh=0.5)
-            img = plot_boxes_cv2(img, boxes, class_names=labels)
-
-        if show_help:
-            cv2.putText(img, help_text, (11, 20), font,
-                        1.0, (32, 32, 32), 4, cv2.LINE_AA)
-            cv2.putText(img, help_text, (10, 20), font,
-                        1.0, (240, 240, 240), 1, cv2.LINE_AA)
-
-        cv2.imshow(WINDOW_NAME, img)
-
-        key = cv2.waitKey(10)
-        if key == 27: # ESC key: quit program
-            break
-        elif key == ord('H') or key == ord('h'): # toggle help message
-            show_help = not show_help
-        elif key == ord('F') or key == ord('f'): # toggle fullscreen
-            full_scrn = not full_scrn
-            if full_scrn:
-                cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN,
-                                      cv2.WINDOW_FULLSCREEN)
+        # print results on the screen
+        if not args.no_display:
+            if args.dnn_model == 'vgg':
+                label = decodePrediction_vgg(res, labels)
+                img = show_preds(img, label, average_time)
             else:
-                cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN,
-                                      cv2.WINDOW_NORMAL)
-        
+                boxes = get_boxes(res, model, conf_thresh=0.5, nms_thresh=0.5)
+                img = plot_boxes_cv2(img, boxes, class_names=labels)
+
+            if show_help:
+                cv2.putText(img, help_text, (11, 20), font,
+                            1.0, (32, 32, 32), 4, cv2.LINE_AA)
+                cv2.putText(img, help_text, (10, 20), font,
+                            1.0, (240, 240, 240), 1, cv2.LINE_AA)
+
+            cv2.imshow(WINDOW_NAME, img)
+
+            key = cv2.waitKey(10)
+            if key == 27: # ESC key: quit program
+                break
+            elif key == ord('H') or key == ord('h'): # toggle help message
+                show_help = not show_help
+            elif key == ord('F') or key == ord('f'): # toggle fullscreen
+                full_scrn = not full_scrn
+                if full_scrn:
+                    cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN,
+                                          cv2.WINDOW_FULLSCREEN)
+                else:
+                    cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN,
+                                          cv2.WINDOW_NORMAL)
 
     cap.release()
-    cv2.destroyAllWindows()
+    if not args.no_display:
+        cv2.destroyAllWindows()

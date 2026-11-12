@@ -43,10 +43,12 @@ class clientCommunication():
     def send_msg(self, msg):
         msg = encode_msg(msg)
         self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.s.settimeout(10.0)
         self.s.connect((self.host, self.port))
         send_msg(self.s, msg)
 
     def receive_msg(self):
+        self.s.settimeout(10.0)
         received = recv_msg(self.s)
         received = decode_msg(received)
         return received
@@ -59,6 +61,7 @@ class serverCommunication():
         self.host = host
         self.port = port
         self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.s.bind((self.host, self.port))
         self.s.listen()
 

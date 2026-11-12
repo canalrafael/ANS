@@ -8,7 +8,10 @@ from PIL import Image, ImageDraw, ImageFont
 from torch.autograd import Variable
 
 import struct
-import imghdr
+try:
+    import imghdr
+except ImportError:
+    imghdr = None
 
 def sigmoid(x):
     return 1.0/(math.exp(-x)+1.)
